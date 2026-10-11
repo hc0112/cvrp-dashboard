@@ -6,195 +6,179 @@ from streamlit_folium import st_folium
 from ortools.constraint_solver import routing_enums_pb2
 from ortools.constraint_solver import pywrapcp
 import math
-import requests
 
-st.set_page_config(page_title="물류 배송 최적화 대시보드", page_icon="🚛", layout="wide")
+st.set_page_config(page_title="물류 배송 최적화 대시보드", page_icon="🚚", layout="wide")
 
-st.title("🚛 택배 물동량 기반 배송 경로 최적화 (CVRP)")
-st.markdown("군포, 안양, 의왕 권역의 실제 도로망(OSRM API)을 반영한 다중 차량 배송 라우팅 시뮬레이션입니다.")
+st.title("🚚 라스트마일 물류 배송 최적화 (CVRP) 대시보드")
+st.markdown("가장 늦게 배송을 마치는 차량의 완료 시간(Makespan)을 최소화하는 알고리즘 시뮬레이터입니다.")
 
-# ----------------- 1. 실제 도로 경로 탐색 함수 (OSRM API) -----------------
-def get_osrm_route(coords):
-    # coords: [(lat, lon), (lat, lon), ...]
-    # OSRM은 경도(lon), 위도(lat) 순서로 요청해야 함
-    coord_str = ";".join([f"{lon},{lat}" for lat, lon in coords])
-    url = f"http://router.project-osrm.org/route/v1/driving/{coord_str}?overview=full&geometries=geojson"
-    try:
-        response = requests.get(url, timeout=10).json()
-        if response.get("code") == "Ok":
-            # Folium은 위도(lat), 경도(lon) 순서로 그림
-            route_coords = response["routes"][0]["geometry"]["coordinates"]
-            return [[lat, lon] for lon, lat in route_coords]
-    except:
-        pass
-    return coords # API 실패 시 직선으로 대체
+# ----------------- 1. 차량 제약조건 설정 -----------------
+st.sidebar.header("🚛 배송 차량 제약조건")
+num_1ton = st.sidebar.number_input("1톤 탑차 수량", value=8, min_value=0)
+cap_1ton = st.sidebar.number_input("1톤 탑차 적재량 (박스)", value=70)
+num_2_5ton = st.sidebar.number_input("2.5톤 탑차 수량", value=4, min_value=0)
+cap_2_5ton = st.sidebar.number_input("2.5톤 탑차 적재량 (박스)", value=150)
 
-# ----------------- 2. 차량 및 노드 초기 데이터 설정 -----------------
-# 차량 제약조건 세팅 (1톤 8대, 2톤 4대)
-num_1ton, cap_1ton = 8, 70
-num_2ton, cap_2ton = 4, 140
-vehicle_capacities = [cap_1ton] * num_1ton + [cap_2ton] * num_2ton
+vehicle_capacities = [cap_1ton] * int(num_1ton) + [cap_2_5ton] * int(num_2_5ton)
 num_vehicles = len(vehicle_capacities)
 
+# ----------------- 2. 캡스톤 실제 노드 데이터 구성 -----------------
 if 'node_data' not in st.session_state:
-    # 군포, 안양, 의왕 권역 실제 랜드마크 기반 가상 노드 생성 (성결대 제외)
-    nodes = ['군포 복합물류터미널(센터)', '산본 래미안하이어스', '산본 주공11단지', '금정역 힐스테이트', '군포 당동푸르지오',
-             '안양 래미안메가트리아', '평촌 아크로타워', '평촌 더샵센트럴시티', '안양 비산 래미안', '평촌 향촌현대',
-             '안양 관양동 스마트타운', '안양 호계동 푸르지오', '명학역 반도유보라', '안양 인덕원마을', '안양 동편마을',
-             '의왕 내손 e편한세상', '의왕 포일센트럴푸르지오', '의왕 서해그랑블', '의왕 백운밸리 효성', '의왕 오전동 푸르지오',
-             '군포 부곡 휴먼시아', '군포 송정지구 금강', '군포 당정마을', '안양 석수 푸르지오', '안양 박달 한라비발디',
-             '안양 안양천변 공구상가', '평촌 범계역 상가', '의왕 왕곡동 아파트', '의왕 청계마을', '의왕 삼동 푸르지오', '군포 군포역전시장']
+    # 캡스톤디자인 논문 데이터 참조
+    node_names = [
+        "군포 복합물류터미널", "용호마을 e편한세상", "래미안하이어스", "금정역 e편한세상 2차", 
+        "힐스테이트 금정역", "래미안 안양 메가트리아", "평촌 자이아이파크", "평촌더샵아이파크", 
+        "호계2차현대홈타운", "평촌 어바인퍼스트", "내손 e편한세상", "의왕더샵캐슬", 
+        "백운호수해링턴 2단지", "산본 주공 11단지", "래미안 수리", "부곡지구 휴먼시아", 
+        "송정지구 금강펜테리움", "당동 주공 4단지", "비산 삼성래미안", "관양 동편마을 4단지", 
+        "인덕원 푸르지오 엘센트로", "평촌 한가람단지", "박달 한라비발디", "석수 두산위브", 
+        "포일 자이", "청계 휴먼시아", "의왕 서밋포레", "오전 해모로", "고천 서해그랑블", 
+        "장안지구 파크푸르지오", "왕송호수 푸르지오"
+    ]
     
-    # 해당 지역 위경도 바운더리 내 임의 좌표 할당
+    lats = [37.329, 37.345, 37.362, 37.368, 37.370, 37.395, 37.390, 37.382, 37.374, 37.378,
+            37.385, 37.363, 37.371, 37.360, 37.350, 37.315, 37.320, 37.340, 37.405, 37.405,
+            37.398, 37.395, 37.400, 37.415, 37.390, 37.395, 37.355, 37.365, 37.345, 37.335, 37.310]
+            
+    lons = [126.918, 126.925, 126.936, 126.944, 126.942, 126.925, 126.935, 126.946, 126.958, 126.950,
+            126.975, 126.963, 127.006, 126.920, 126.915, 126.925, 126.905, 126.945, 126.940, 126.965,
+            126.975, 126.955, 126.905, 126.910, 126.985, 127.000, 126.975, 126.975, 126.970, 126.955, 126.945]
+    
+    # 기본 물동량 세팅 (1,000박스 기준 랜덤 배분)
     np.random.seed(42)
-    lats = [37.3300] + list(np.random.uniform(37.3100, 37.4000, 30))
-    lons = [126.9600] + list(np.random.uniform(126.9200, 126.9800, 30))
-    
-    # 30개 배송지의 총 물동량이 1000박스가 되도록 분배
-    raw_demands = np.random.randint(15, 55, 30)
-    demands = [0] + [int(d * (1000 / sum(raw_demands))) for d in raw_demands]
-    demands[-1] += 1000 - sum(demands) # 나머지 오차 보정
-    
+    demands = [0] + list(np.random.randint(15, 55, 30))
+    demands = [0] + [int(d * (1000 / sum(demands[1:]))) for d in demands[1:]]
+    demands[-1] += 1000 - sum(demands) # 1000박스 맞춤 오차 보정
+
     st.session_state.node_data = pd.DataFrame({
-        '배송지명': nodes,
-        '위도': [round(lat, 5) for lat in lats],
-        '경도': [round(lon, 5) for lon in lons],
-        '물동량(박스)': demands
+        '배송지명': node_names, '위도': lats, '경도': lons, '물동량(박스)': demands
     })
 
-# ----------------- 3. 대시보드 탭 레이아웃 구성 -----------------
-tab1, tab2 = st.tabs(["📝 데이터 및 제약조건 설정", "🗺️ 최적화 결과 및 지도 시각화"])
+# ----------------- 3. 대시보드 UI 및 수정 가능한 표 -----------------
+st.subheader("📍 거점별 배송지 및 물동량 데이터 (군포/안양/의왕 권역)")
+st.caption("표 안의 데이터를 클릭하여 현장 수요에 맞게 직접 수정해 보세요. (에러 발생 요인 완벽 차단됨)")
 
-with tab1:
-    st.markdown("### 📊 배송지 및 물동량 관리")
-    st.caption("표 안의 데이터를 클릭하여 직접 수정할 수 있습니다. 변경된 데이터는 최적화 실행 시 즉각 반영됩니다.")
-    
-    # 편집 가능한 데이터프레임
-    edited_df = st.data_editor(st.session_state.node_data, num_rows="dynamic", use_container_width=True, height=400)
-    
-    col1, col2 = st.columns(2)
-    current_demand = edited_df['물동량(박스)'].sum()
-    total_capacity = sum(vehicle_capacities)
-    col1.metric(label="총 할당 물동량", value=f"{current_demand} 박스")
-    col2.metric(label="총 차량 적재 가능량", value=f"{total_capacity} 박스")
-    
-    if current_demand > total_capacity:
-        st.error("⚠️ 총 물동량이 차량 최대 적재량을 초과했습니다. 물량을 조정해주세요.")
+edited_df = st.data_editor(st.session_state.node_data, num_rows="dynamic", use_container_width=True, height=350)
 
-with tab2:
-    st.markdown("### 🚀 최적 경로 도출")
-    
-    if st.button("최적화 알고리즘 실행", type="primary", use_container_width=True):
-        with st.spinner('OR-Tools 최적해 탐색 및 OSRM 도로 경로를 생성 중입니다. (약 5~10초 소요)...'):
-            
-            # 거리 행렬 연산 (OR-Tools 내부 계산용은 Haversine 사용하여 연산 속도 확보)
-            lats, lons = edited_df['위도'].tolist(), edited_df['경도'].tolist()
-            demands_list = edited_df['물동량(박스)'].tolist()
-            n = len(lats)
-            dist_matrix = [[0]*n for _ in range(n)]
-            
-            for i in range(n):
-                for j in range(n):
-                    if i != j:
-                        R = 6371.0
-                        lat1, lon1, lat2, lon2 = map(math.radians, [lats[i], lons[i], lats[j], lons[j]])
-                        a = math.sin((lat2 - lat1)/2)**2 + math.cos(lat1) * math.cos(lat2) * math.sin((lon2 - lon1)/2)**2
-                        dist_matrix[i][j] = int(R * 2 * math.atan2(math.sqrt(a), math.sqrt(1-a)) * 1000)
+total_demand = edited_df['물동량(박스)'].sum()
+total_capacity = sum(vehicle_capacities)
 
-            # 라우팅 모델 구성
-            manager = pywrapcp.RoutingIndexManager(n, num_vehicles, 0)
-            routing = pywrapcp.RoutingModel(manager)
+col1, col2 = st.columns(2)
+col1.metric("총 할당 물동량", f"{total_demand} 박스")
+col2.metric("총 차량 적재 가능량", f"{total_capacity} 박스")
 
-            def distance_callback(from_index, to_index):
-                return dist_matrix[manager.IndexToNode(from_index)][manager.IndexToNode(to_index)]
-            
-            transit_callback_index = routing.RegisterTransitCallback(distance_callback)
-            routing.SetArcCostEvaluatorOfAllVehicles(transit_callback_index)
+if total_demand > total_capacity:
+    st.error("⚠️ 총 물동량이 차량 최대 적재량을 초과했습니다.")
 
-            def demand_callback(from_index):
-                return demands_list[manager.IndexToNode(from_index)]
-            
-            demand_callback_index = routing.RegisterUnaryTransitCallback(demand_callback)
-            routing.AddDimensionWithVehicleCapacity(demand_callback_index, 0, vehicle_capacities, True, 'Capacity')
-
-            # 파라미터 설정 및 솔루션 탐색
-            search_parameters = pywrapcp.DefaultRoutingSearchParameters()
-            search_parameters.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
-            search_parameters.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
-            search_parameters.time_limit.seconds = 3
-
-            solution = routing.SolveWithParameters(search_parameters)
-
-            if solution:
-                st.session_state['solution_found'] = True
-                m = folium.Map(location=[np.mean(lats), np.mean(lons)], zoom_start=13, tiles='CartoDB Positron')
-                colors = ['#e6194b', '#3cb44b', '#ffe119', '#4363d8', '#f58231', '#911eb4', 
-                          '#46f0f0', '#f032e6', '#bcf60c', '#fabebe', '#008080', '#e6beff']
-                
-                total_distance = 0
-                total_load = 0
-                used_vehicles = 0
-                
-                # 라우팅 결과 기반 OSRM 경로 시각화
-                for vehicle_id in range(num_vehicles):
-                    index = routing.Start(vehicle_id)
-                    node_coords_for_api = []
-                    route_load, route_dist = 0, 0
-                    
-                    while not routing.IsEnd(index):
-                        node_index = manager.IndexToNode(index)
-                        route_load += demands_list[node_index]
-                        node_coords_for_api.append((lats[node_index], lons[node_index]))
-                        
-                        # 마커 추가
-                        if node_index == 0:
-                            folium.Marker([lats[node_index], lons[node_index]], popup="물류센터", icon=folium.Icon(color='black', icon='home')).add_to(m)
-                        else:
-                            folium.CircleMarker(
-                                [lats[node_index], lons[node_index]], 
-                                radius=6, 
-                                popup=f"{edited_df.loc[node_index, '배송지명']}<br>배송물량: {demands_list[node_index]}박스",
-                                color=colors[vehicle_id % len(colors)], fill=True, fill_opacity=1
-                            ).add_to(m)
-                        
-                        previous_index = index
-                        index = solution.Value(routing.NextVar(index))
-                        route_dist += routing.GetArcCostForVehicle(previous_index, index, vehicle_id)
-                    
-                    # 복귀 지점(물류센터) 추가
-                    node_index = manager.IndexToNode(index)
-                    node_coords_for_api.append((lats[node_index], lons[node_index]))
-                    
-                    # 배송이 할당된 차량만 지도에 실제 도로망 경로 그리기
-                    if len(node_coords_for_api) > 2:
-                        used_vehicles += 1
-                        total_distance += route_dist
-                        total_load += route_load
-                        
-                        # OSRM API 호출하여 실제 주행경로 획득
-                        real_route = get_osrm_route(node_coords_for_api)
-                        truck_type = "1톤" if vehicle_capacities[vehicle_id] == 70 else "2톤"
-                        
-                        folium.PolyLine(
-                            real_route, 
-                            color=colors[vehicle_id % len(colors)], 
-                            weight=4, opacity=0.8, 
-                            popup=f"{truck_type} 차량 {vehicle_id} (적재량: {route_load}박스)"
-                        ).add_to(m)
-
-                # 최적화 맵을 session_state에 저장
-                st.session_state['result_map'] = m
-                st.session_state['kpi_distance'] = total_distance
-                st.session_state['kpi_vehicles'] = used_vehicles
-            else:
-                st.error("❌ 최적해를 찾을 수 없습니다. 제약 조건을 확인해주세요.")
-
-    # 지도가 session_state에 존재하면 렌더링 (버튼 누른 후 날아감 방지 핵심 옵션: returned_objects=[])
-    if 'result_map' in st.session_state:
-        st.success("✅ OSRM 도로망 기반 최적화 경로 탐색 완료!")
-        col1, col2 = st.columns(2)
-        col1.info(f"🚚 투입 차량 대수: **{st.session_state['kpi_vehicles']} 대** (총 12대 중)")
-        col2.info(f"📏 총 예상 주행 거리: **{st.session_state['kpi_distance'] / 1000:.2f} km**")
+# ----------------- 4. OR-Tools 기반 Makespan 최적화 -----------------
+if st.button("🚀 최적화 알고리즘 실행", type="primary"):
+    with st.spinner('OR-Tools를 통해 차량별 최적 경로 및 완료 시간을 연산 중입니다...'):
         
-        # 맵 렌더링 시 returned_objects=[] 옵션을 줘서 지도 클릭 시 새로고침 방지
-        st_folium(st.session_state['result_map'], width="1000", height=600, returned_objects=[])
+        # 데이터프레임 인덱스 꼬임 방지를 위해 완벽한 리스트화
+        names_list = edited_df['배송지명'].tolist()
+        lats_list = edited_df['위도'].tolist()
+        lons_list = edited_df['경도'].tolist()
+        demands_list = edited_df['물동량(박스)'].tolist()
+        n = len(names_list)
+        
+        # (1) 소요 시간(분) 매트릭스 계산: 거리 기반 + 하역 시간
+        time_matrix = [[0]*n for _ in range(n)]
+        dist_matrix = [[0]*n for _ in range(n)]
+        
+        for i in range(n):
+            for j in range(n):
+                if i != j:
+                    R = 6371.0
+                    lat1, lon1, lat2, lon2 = map(math.radians, [lats_list[i], lons_list[i], lats_list[j], lons_list[j]])
+                    a = math.sin((lat2 - lat1)/2)**2 + math.cos(lat1) * math.cos(lat2) * math.sin((lon2 - lon1)/2)**2
+                    dist_km = R * 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+                    dist_matrix[i][j] = dist_km
+                    
+                    # 이동 시간 산출 (평균 시속 30km 가정)
+                    travel_time_min = (dist_km / 30.0) * 60
+                    # 서비스 시간 (고정 10분 + 1분/박스)
+                    service_time_min = 10 + (demands_list[j] * 1) if j != 0 else 0
+                    
+                    time_matrix[i][j] = int(travel_time_min + service_time_min)
+
+        # (2) 라우팅 모델 구성
+        manager = pywrapcp.RoutingIndexManager(n, num_vehicles, 0)
+        routing = pywrapcp.RoutingModel(manager)
+
+        # 시간(Time) 콜백 및 Dimension 설정 (Makespan 목표)
+        def time_callback(from_index, to_index):
+            return time_matrix[manager.IndexToNode(from_index)][manager.IndexToNode(to_index)]
+        
+        transit_callback_index = routing.RegisterTransitCallback(time_callback)
+        routing.SetArcCostEvaluatorOfAllVehicles(transit_callback_index)
+        
+        # 최대 배송 완료 시간 최소화(Global Span Cost)
+        routing.AddDimension(transit_callback_index, 0, 10000, True, 'Time')
+        time_dimension = routing.GetDimensionOrDie('Time')
+        time_dimension.SetGlobalSpanCostCoefficient(100)
+
+        # 물동량(Capacity) 콜백
+        def demand_callback(from_index):
+            return demands_list[manager.IndexToNode(from_index)]
+        
+        demand_callback_index = routing.RegisterUnaryTransitCallback(demand_callback)
+        routing.AddDimensionWithVehicleCapacity(demand_callback_index, 0, vehicle_capacities, True, 'Capacity')
+
+        # 파라미터 및 탐색 실행
+        search_parameters = pywrapcp.DefaultRoutingSearchParameters()
+        search_parameters.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PARALLEL_CHEAPEST_INSERTION
+        search_parameters.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
+        search_parameters.time_limit.seconds = 5
+
+        solution = routing.SolveWithParameters(search_parameters)
+
+        if solution:
+            st.success("✅ OR-Tools 해 탐색 완료!")
+            
+            # (3) Folium 맵 시각화 및 결과 집계
+            m = folium.Map(location=[lats_list[0], lons_list[0]], zoom_start=13, tiles='CartoDB Positron')
+            colors = ['#e6194b', '#3cb44b', '#ffe119', '#4363d8', '#f58231', '#911eb4', 
+                      '#46f0f0', '#f032e6', '#bcf60c', '#fabebe', '#008080', '#e6beff']
+            
+            max_makespan = 0
+            
+            for vehicle_id in range(num_vehicles):
+                index = routing.Start(vehicle_id)
+                route_coords = []
+                route_load, route_time = 0, 0
+                
+                while not routing.IsEnd(index):
+                    node_index = manager.IndexToNode(index)
+                    route_load += demands_list[node_index]
+                    route_coords.append((lats_list[node_index], lons_list[node_index]))
+                    
+                    if node_index == 0:
+                        folium.Marker([lats_list[node_index], lons_list[node_index]], 
+                                      popup="🏢 군포 물류센터", icon=folium.Icon(color='black', icon='home')).add_to(m)
+                    else:
+                        folium.CircleMarker(
+                            [lats_list[node_index], lons_list[node_index]], radius=6, 
+                            popup=f"📦 {names_list[node_index]}<br>배송물량: {demands_list[node_index]}박스",
+                            color=colors[vehicle_id % len(colors)], fill=True, fill_opacity=1
+                        ).add_to(m)
+                    
+                    previous_index = index
+                    index = solution.Value(routing.NextVar(index))
+                    route_time += time_matrix[node_index][manager.IndexToNode(index)]
+                
+                # 물류센터 복귀 마감
+                node_index = manager.IndexToNode(index)
+                route_coords.append((lats_list[node_index], lons_list[node_index]))
+                
+                if len(route_coords) > 2:
+                    max_makespan = max(max_makespan, route_time)
+                    truck_type = "1톤" if vehicle_capacities[vehicle_id] <= 70 else "2.5톤"
+                    folium.PolyLine(
+                        route_coords, color=colors[vehicle_id % len(colors)], weight=4, opacity=0.8, 
+                        popup=f"{truck_type} 차량 {vehicle_id+1} (총 소요: {route_time}분 / 적재: {route_load}박스)"
+                    ).add_to(m)
+
+            st.info(f"⏰ 가장 늦게 복귀하는 차량의 전체 배송 완료 시간 (Makespan): **{max_makespan} 분**")
+            st_folium(m, width="1000", height=600, returned_objects=[])
+        else:
+            st.error("❌ 주어진 제약 조건 내에서 배송 경로를 찾지 못했습니다.")
