@@ -4,3 +4,4 @@ numpy
 folium
 streamlit-folium
 ortools
+requests
